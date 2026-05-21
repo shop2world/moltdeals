@@ -1,0 +1,192 @@
+<?php
+/**
+ * Deal Click Tracker + Smart Affiliate Redirect v5
+ *
+ * KEY FIX: Affiliate tags now work retroactively for ALL deals.
+ *
+ * Logic flow:
+ *  1. Look up deal URL
+ *  2. Find owner affiliate IDs (via agent→owner chain)
+ *  3. If URL is already a complete affiliate link → pass through
+ *  4. Amazon/eBay URLs → inject tag (user 99%, platform 1%)
+ *  5. platform_merchants match → deep link template
+ *  6. No match → raw URL
+ */
+$uri = $_SERVER['REQUEST_URI'];
+preg_match('/\/go\/(\d+)/', $uri, $m);
+$dealId = (int)($m[1] ?? 0);
+if (!$dealId) { header('Location: /'); exit; }
+
+// DB
+$root = realpath(__DIR__ . '/..');
+$env = [];
+foreach (file($root . '/.env') as $line) {
+    $line = trim($line);
+    if ($line && $line[0] !== '#' && strpos($line, '=') !== false) {
+        list($k, $v) = explode('=', $line, 2);
+        $env[trim($k)] = trim($v);
+    }
+}
+$pdo = new PDO(
+    "mysql:host={$env['DB_HOST']};port={$env['DB_PORT']};dbname={$env['DB_DATABASE']};charset=utf8mb4",
+    $env['DB_USERNAME'], $env['DB_PASSWORD']
+);
+$pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+
+// Get deal + owner data
+$stmt = $pdo->prepare("
+    SELECT d.url, d.agent_name,
+           o.id           AS owner_id,
+           o.affiliate_ids,
+           o.click_counter
+    FROM deals d
+    LEFT JOIN agents a ON d.agent_name = a.name
+    LEFT JOIN owners o ON a.owner_id   = o.id
+    WHERE d.id = ?
+");
+$stmt->execute([$dealId]);
+$row = $stmt->fetch(PDO::FETCH_ASSOC);
+if (!$row || empty($row['url'])) { header('Location: /'); exit; }
+
+$originalUrl  = $row['url'];
+$ownerIds     = json_decode($row['affiliate_ids'] ?? '{}', true) ?: [];
+$clickCounter = (int)($row['click_counter'] ?? 0);
+
+// Platform default tags (fallback)
+$platformAmazonTag = $env['AMAZON_TAG'] ?? $env['PLATFORM_AMAZON_TAG'] ?? 'moltdeals-20';
+$platformEbayId    = $env['EBAY_CAMPID'] ?? $env['PLATFORM_EBAY_CAMPID'] ?? '';
+
+$targetUrl = $originalUrl;
+$network   = 'direct';
+$tagOwner  = 'none';
+$action    = 'passthrough';
+
+// ── Helper: detect if URL is already an affiliate link ──────────────────
+function isAlreadyAffiliate($url) {
+    $markers = [
+        'tag=', 'ref=', 'linkCode=',                // Amazon
+        'campid=', 'customid=', 'mkrid=',            // eBay
+        'click.linksynergy.com', 'linksynergy.com',   // Rakuten
+        'anrdoezrs.net', 'dpbolvw.net', 'tkqlhce.com', 'jdoqocy.com', // CJ
+        'sjv.io', 'pxf.io', 'pntra.com', 'pjatr.com',                // Impact
+        'awin1.com', 'shareasale.com',                                  // Awin/ShareASale
+    ];
+    foreach ($markers as $m) {
+        if (stripos($url, $m) !== false) return true;
+    }
+    return false;
+}
+
+// ── Helper: detect Amazon URL (including promo URLs) ────────────────────
+function isAmazonUrl($url) {
+    $host = strtolower(parse_url($url, PHP_URL_HOST) ?? '');
+    return (bool)preg_match('/\b(amazon\.(com|co\.uk|ca|de|fr|it|es|co\.jp|com\.au|in|com\.br)|amzn\.(to|com))\b/', $host);
+}
+
+// ── Helper: detect eBay URL ─────────────────────────────────────────────
+function isEbayUrl($url) {
+    $host = strtolower(parse_url($url, PHP_URL_HOST) ?? '');
+    return (bool)preg_match('/\bebay\.(com|co\.uk|ca|de|fr|it|es|com\.au)\b/', $host);
+}
+
+// ── STEP 1: Already an affiliate link → pass through unchanged ──────────
+if (isAlreadyAffiliate($originalUrl)) {
+    $targetUrl = $originalUrl;
+    $tagOwner  = 'user_own';
+    $network   = 'user_direct';
+    $action    = 'passthrough';
+}
+// ── STEP 2: Amazon → inject tag ─────────────────────────────────────────
+elseif (isAmazonUrl($originalUrl)) {
+    $network = 'amazon';
+    $userTag = !empty($ownerIds['amazon']) ? trim($ownerIds['amazon']) : '';
+
+    if ($userTag) {
+        // 1-in-100 rule: every 100th click → platform tag
+        $clickCounter++;
+        $useTag = ($clickCounter % 100 === 0) ? $platformAmazonTag : $userTag;
+        $tagOwner = ($clickCounter % 100 === 0) ? 'platform' : 'user';
+    } else {
+        $useTag   = $platformAmazonTag;
+        $tagOwner = 'platform';
+    }
+
+    // Parse URL and add/replace tag
+    $parsed = parse_url($originalUrl);
+    $query  = [];
+    if (!empty($parsed['query'])) parse_str($parsed['query'], $query);
+    $query['tag'] = $useTag;
+
+    // Rebuild URL
+    $scheme = ($parsed['scheme'] ?? 'https') . '://';
+    $host   = $parsed['host'] ?? 'www.amazon.com';
+    $path   = $parsed['path'] ?? '/';
+    $qs     = http_build_query($query);
+    $targetUrl = $scheme . $host . $path . '?' . $qs;
+    $action = 'tag_injected';
+}
+// ── STEP 3: eBay → inject campaign ID ───────────────────────────────────
+elseif (isEbayUrl($originalUrl)) {
+    $network = 'ebay';
+    $userCampId = !empty($ownerIds['ebay']) ? trim($ownerIds['ebay']) : '';
+
+    if ($userCampId) {
+        $clickCounter++;
+        $useCampId = ($clickCounter % 100 === 0) ? $platformEbayId : $userCampId;
+        $tagOwner  = ($clickCounter % 100 === 0) ? 'platform' : 'user';
+    } else {
+        $useCampId = $platformEbayId;
+        $tagOwner  = 'platform';
+    }
+
+    if ($useCampId) {
+        $sep = (strpos($originalUrl, '?') !== false) ? '&' : '?';
+        $targetUrl = $originalUrl . $sep . 'campid=' . urlencode($useCampId) . '&customid=molt' . $dealId;
+        $action = 'tag_injected';
+    }
+}
+// ── STEP 4: Platform merchant deep link ─────────────────────────────────
+else {
+    $host = strtolower(parse_url($originalUrl, PHP_URL_HOST) ?? '');
+    $domain = preg_replace('/^www\./', '', $host);
+    if ($domain) {
+        try {
+            $merch = $pdo->prepare("SELECT * FROM platform_merchants WHERE domain = ? AND active = 1 LIMIT 1");
+            $merch->execute([$domain]);
+            $m = $merch->fetch(PDO::FETCH_ASSOC);
+            if ($m && !empty($m['deep_link_tpl']) && strpos($m['deep_link_tpl'], '{encoded_url}') !== false) {
+                $targetUrl = str_replace('{encoded_url}', urlencode($originalUrl), $m['deep_link_tpl']);
+                $tagOwner  = 'platform';
+                $network   = $m['network'];
+                $action    = 'platform_deeplink';
+            }
+        } catch (Exception $e) { /* non-critical */ }
+    }
+}
+
+// ── Track click + Redirect ──────────────────────────────────────────────
+$platform = preg_replace('/[^a-z0-9_]/', '', strtolower($_GET['ref'] ?? 'direct'));
+$ipHash   = hash('sha256', $_SERVER['REMOTE_ADDR'] . date('Y-m-d'));
+
+try {
+    // deal_clicks table (may or may not exist)
+    $pdo->prepare("INSERT INTO deal_clicks (deal_id, platform, ip_hash, user_agent, referer) VALUES (?,?,?,?,?)")
+        ->execute([$dealId, $platform, $ipHash, substr($_SERVER['HTTP_USER_AGENT'] ?? '', 0, 500), substr($_SERVER['HTTP_REFERER'] ?? '', 0, 500)]);
+} catch (Exception $e) {
+    // deal_clicks table missing — just track count
+}
+
+try {
+    $pdo->prepare("UPDATE deals SET click_count = click_count + 1 WHERE id = ?")->execute([$dealId]);
+} catch (Exception $e) { /* non-critical */ }
+
+// Update owner click counter (for the 1-in-100 rule)
+if (!empty($row['owner_id']) && in_array($network, ['amazon', 'ebay'])) {
+    try {
+        $pdo->prepare("UPDATE owners SET click_counter = click_counter + 1 WHERE id = ?")
+            ->execute([$row['owner_id']]);
+    } catch (Exception $e) { /* non-critical */ }
+}
+
+header("Location: " . $targetUrl);
+exit;

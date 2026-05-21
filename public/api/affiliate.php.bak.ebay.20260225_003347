@@ -1,0 +1,55 @@
+<?php
+class SmartAffiliate {
+    public static function isAlreadyAffiliate($url) {
+        $markers = ['tag=', 'campid=', 'linksynergy', 'anrdoezrs', 'sjv.io', 'pxf.io', 'tkqlhce', 'jdoqocy'];
+        foreach ($markers as $m) if (stripos($url, $m) !== false) return true;
+        return false;
+    }
+
+    public static function buildUrl($url, $ownerIds, $clickCounter, $defaults = []) {
+        $host = strtolower(parse_url($url, PHP_URL_HOST) ?? '');
+        $isAmazon = (strpos($host, 'amazon.com') !== false || strpos($host, 'amzn.to') !== false);
+        $isEbay   = (strpos($host, 'ebay.com') !== false);
+
+        if (!$isAmazon && !$isEbay) {
+            return ['url' => $url, 'network' => 'other', 'tag_owner' => 'none', 'action' => 'passthrough'];
+        }
+
+        $network = $isAmazon ? 'amazon' : 'ebay';
+        
+        // 1-in-100 logic
+        $usePlatformTag = ($clickCounter > 0 && $clickCounter % 100 === 0);
+        
+        // Tag Selection
+        $tagOwner = 'user_own';
+        $tag = trim($ownerIds[$network] ?? '');
+        
+        if (empty($tag)) {
+            $tag = trim($defaults[$network] ?? '');
+            $tagOwner = 'platform_default';
+        }
+        
+        if ($usePlatformTag) {
+            $tag = trim($defaults[$network] ?? '');
+            $tagOwner = 'platform_fee';
+        }
+
+        if (empty($tag)) {
+            return ['url' => $url, 'network' => $network, 'tag_owner' => 'none_found', 'action' => 'passthrough'];
+        }
+
+        // Apply Tag
+        if ($isAmazon) {
+            $url = preg_replace('/([?&])tag=[^&]*/', '', $url);
+            $url = rtrim($url, '?&');
+            $sep = (strpos($url, '?') !== false) ? '&' : '?';
+            $url .= $sep . 'tag=' . urlencode($tag);
+        } else if ($isEbay) {
+            // Standard eBay Rover URL structure matching EPN specs
+            $encUrl = urlencode($url);
+            $url = "https://rover.ebay.com/rover/1/711-53200-19255-0/1?mpre={$encUrl}&campid=" . urlencode($tag) . "&toolid=10001&customid=moltdeals";
+        }
+
+        return ['url' => $url, 'network' => $network, 'tag_owner' => $tagOwner, 'action' => 'tagged'];
+    }
+}

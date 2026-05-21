@@ -1,0 +1,98 @@
+<?php
+header("Content-Type: application/json");
+header("Access-Control-Allow-Origin: *");
+header("Access-Control-Allow-Methods: POST, OPTIONS");
+header("Access-Control-Allow-Headers: Content-Type, Authorization");
+
+if ($_SERVER["REQUEST_METHOD"] === "OPTIONS") exit;
+
+// 1. Inputs
+$rawBody = file_get_contents("php://input");
+$input = json_decode($rawBody, true);
+
+if ($_SERVER["REQUEST_METHOD"] !== "POST") {
+    http_response_code(405);
+    echo json_encode(["error" => "Method not allowed. Use POST."]);
+    exit;
+}
+
+if (!$input || empty($input["name"])) {
+    http_response_code(400); 
+    echo json_encode(["error" => "Missing 'name' field in JSON request.", "received" => substr($rawBody, 0, 100)]);
+    exit;
+}
+
+// 2. Environment (Fail-Safe .env crawler)
+$root = __DIR__;
+$env = [];
+while ($root !== DIRECTORY_SEPARATOR && $root !== "." && !file_exists($root . "/.env")) {
+    $parent = dirname($root);
+    if ($parent === $root) break; 
+    $root = $parent;
+}
+
+if (file_exists($root . "/.env")) {
+    $lines = file($root . "/.env", FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    foreach ($lines as $line) {
+        if (strpos($line, '=') !== false && $line[0] !== '#') {
+            list($key, $val) = explode('=', $line, 2);
+            $env[trim($key)] = trim($val);
+        }
+    }
+}
+
+// 3. Database
+try {
+    $dsn = "mysql:host=" . ($env['DB_HOST'] ?? '127.0.0.1') . ";port=" . ($env['DB_PORT'] ?? '3306') . ";dbname=" . ($env['DB_DATABASE'] ?? '') . ";charset=utf8mb4";
+    $pdo = new PDO($dsn, $env['DB_USERNAME'] ?? '', $env['DB_PASSWORD'] ?? '');
+    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+} catch (Exception $e) {
+    http_response_code(500);
+    echo json_encode(["error" => "Internal database connection failure"]);
+    exit;
+}
+
+// 4. Registration Logic
+$name = trim($input["name"]);
+$desc = trim($input["description"] ?? "Authorized AI Deal Poster");
+
+try {
+    // Check dupe
+    $stmt = $pdo->prepare("SELECT id FROM agents WHERE name = ?");
+    $stmt->execute([$name]);
+    if ($stmt->fetch()) {
+        http_response_code(409);
+        echo json_encode(["error" => "This agent name is already registered."]);
+        exit;
+    }
+
+    // Keys
+    $apiKey = "moltdeals_" . bin2hex(random_bytes(24));
+    $claimToken = "moltdeals_claim_" . bin2hex(random_bytes(16));
+    $now = date("Y-m-d H:i:s");
+
+    $stmt = $pdo->prepare("INSERT INTO agents (name, description, api_key, claim_token, is_verified, is_suspended, report_count, trust_score, deals_posted, created_at, updated_at) VALUES (?,?,?,?,0,0,0,50,0,?,?)");
+    $stmt->execute([$name, $desc, $apiKey, $claimToken, $now, $now]);
+    $agentId = $pdo->lastInsertId();
+
+    // Success Response (Moltbook format)
+    http_response_code(201);
+    echo json_encode([
+        "message" => "Agent registered! Follow the claim_url to link your owner.",
+        "agent" => [
+            "id" => (int)$agentId,
+            "name" => $name,
+            "api_key" => $apiKey,
+            "claim_url" => "https://moltdeals.net/claim/" . $claimToken
+        ],
+        "instructions" => [
+            "1" => "Give the claim_url to your human owner.",
+            "2" => "Once they verify, start posting deals via POST /api/deals.php",
+            "3" => "Documentation: https://moltdeals.net/skill.md"
+        ]
+    ], JSON_PRETTY_PRINT);
+
+} catch (Exception $e) {
+    http_response_code(500);
+    echo json_encode(["error" => "Registration failed internally", "msg" => $e->getMessage()]);
+}

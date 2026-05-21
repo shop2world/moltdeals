@@ -1,0 +1,76 @@
+<?php
+$uri = $_SERVER['REQUEST_URI'];
+preg_match('/\/go\/(\d+)/', $uri, $m);
+$dealId = (int)($m[1] ?? 0);
+if (!$dealId) { header('Location: /'); exit; }
+
+$root = realpath(__DIR__ . '/..');
+$env = [];
+if (file_exists($root . '/.env')) {
+    foreach (file($root . '/.env') as $line) {
+        $line = trim($line);
+        if ($line && $line[0] !== '#' && strpos($line, '=') !== false) {
+            list($k, $v) = explode('=', $line, 2); $env[trim($k)] = trim($v);
+        }
+    }
+}
+try {
+    $pdo = new PDO("mysql:host={$env['DB_HOST']};dbname={$env['DB_DATABASE']};charset=utf8mb4", $env['DB_USERNAME'], $env['DB_PASSWORD']);
+    
+    // Get Deal + Agent + Owner Details
+    $stmt = $pdo->prepare("
+        SELECT d.url, a.owner_id, o.affiliate_ids, o.click_counter
+        FROM deals d
+        LEFT JOIN agents a ON (d.agent_moltbook_id = CONCAT('agent_', a.id) OR d.agent_name = a.name)
+        LEFT JOIN owners o ON a.owner_id = o.id
+        WHERE d.id = ? LIMIT 1
+    ");
+    $stmt->execute([$dealId]);
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$row || empty($row['url'])) { header('Location: /'); exit; }
+
+    require_once __DIR__ . '/api/affiliate.php';
+    
+    $configPath = __DIR__ . '/config/merchant_map.json';
+    $mapConfig  = file_exists($configPath) ? json_decode(file_get_contents($configPath), true) : [];
+    $defaults   = $mapConfig['_defaults'] ?? [];
+    
+    // fallback defaults if config missing
+    if (empty($defaults['amazon'])) $defaults['amazon'] = 'moltdeals-20';
+    if (empty($defaults['ebay'])) $defaults['ebay'] = '5331234567';
+
+    $ownerIds = json_decode($row['affiliate_ids'] ?? '{}', true) ?: [];
+    $clickCounter = (int)($row['click_counter'] ?? 0);
+
+    // Track click BEFORE redirect
+    $pdo->prepare("UPDATE deals SET click_count = click_count + 1 WHERE id = ?")->execute([$dealId]);
+
+    // Build Affiliate URL
+    if (SmartAffiliate::isAlreadyAffiliate($row['url'])) {
+        $targetUrl = $row['url'];
+    } else {
+        $result = SmartAffiliate::buildUrl($row['url'], $ownerIds, $clickCounter, $defaults);
+        $targetUrl = $result['url'];
+        
+        if (in_array($result['network'], ['amazon', 'ebay']) && !empty($row['owner_id'])) {
+            $pdo->prepare("UPDATE owners SET click_counter = click_counter + 1 WHERE id = ?")->execute([$row['owner_id']]);
+        } else if ($result['network'] === 'other') {
+            // Check platform_merchants table for Rakuten/CJ/Impact
+            $domain = preg_replace('/^www\./', '', strtolower(parse_url($row['url'], PHP_URL_HOST) ?? ''));
+            if ($domain) {
+                $merchConfig = file_exists(__DIR__ . '/config/merchant_map.json') ? json_decode(file_get_contents(__DIR__ . '/config/merchant_map.json'), true) : [];
+                $m = $merchConfig[$domain] ?? null;
+                if ($m && !($m['active'] ?? true)) $m = null;
+                if ($m && !empty($m['deep_link_tpl'])) {
+                    $targetUrl = str_replace('{encoded_url}', urlencode($row['url']), $m['deep_link_tpl']);
+                }
+            }
+        }
+    }
+
+    header("Location: " . $targetUrl);
+    exit;
+} catch(Exception $e) {
+    header("Location: /"); exit;
+}

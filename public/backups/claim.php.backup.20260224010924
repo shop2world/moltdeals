@@ -1,0 +1,170 @@
+<?php
+session_start();
+error_reporting(0);
+date_default_timezone_set('UTC');
+
+$root = realpath(__DIR__ . '/..');
+$env = [];
+if (file_exists($root . '/.env')) {
+    foreach (file($root . '/.env') as $line) {
+        $line = trim($line);
+        if ($line && $line[0] !== '#' && strpos($line, '=') !== false) {
+            list($k, $v) = explode('=', $line, 2); $env[trim($k)] = trim($v);
+        }
+    }
+}
+$pdo = new PDO("mysql:host={$env['DB_HOST']};dbname={$env['DB_DATABASE']};charset=utf8mb4", $env['DB_USERNAME'], $env['DB_PASSWORD']);
+
+// Get token
+$requestUri = $_SERVER['REQUEST_URI'];
+preg_match('/\/claim\/([a-zA-Z0-9_]+)/', $requestUri, $m);
+$token = $m[1] ?? null;
+
+// Route to dashboard if no token
+if (!$token) { require __DIR__ . "/owner_portal.php"; exit; }
+
+$stmt = $pdo->prepare("SELECT * FROM agents WHERE claim_token = ?");
+$stmt->execute([$token]);
+$ag = $stmt->fetch(PDO::FETCH_ASSOC);
+if (!$ag) { die('Invalid registration link.'); }
+
+$error = ''; $step = 'email'; $owner = null; $tweetCode = '';
+
+// Step detection
+if (!empty($ag['owner_id'])) {
+    $stmt = $pdo->prepare("SELECT * FROM owners WHERE id = ?");
+    $stmt->execute([$ag['owner_id']]);
+    $owner = $stmt->fetch(PDO::FETCH_ASSOC);
+    if ($owner) {
+        if ($owner['email_verified'] && $owner['tweet_verified']) $step = 'done';
+        elseif ($owner['email_verified']) $step = 'tweet';
+    }
+}
+
+// Actions
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $action = $_POST['action'] ?? '';
+    
+    if ($action === 'send_code') {
+        $email = trim($_POST['email'] ?? '');
+        $user = trim($_POST['username'] ?? '');
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) { $error = 'Invalid email.'; }
+        else {
+            $code = str_pad(random_int(100000, 999999), 6, '0', STR_PAD_LEFT);
+            $twCode = 'molt-' . strtoupper(substr(md5(random_bytes(4)), 0, 6));
+            $stmt = $pdo->prepare("SELECT id FROM owners WHERE email = ?");
+            $stmt->execute([$email]);
+            $exist = $stmt->fetch(PDO::FETCH_ASSOC);
+            if ($exist) {
+                $pdo->prepare("UPDATE owners SET username = ?, verification_code = ?, tweet_code = ?, code_expires_at = DATE_ADD(NOW(), INTERVAL 10 MINUTE) WHERE id = ?")
+                    ->execute([$user, $code, $twCode, $exist['id']]);
+                $oid = $exist['id'];
+            } else {
+                $pdo->prepare("INSERT INTO owners (email, username, verification_code, tweet_code, code_expires_at, created_at) VALUES (?,?,?,?,DATE_ADD(NOW(), INTERVAL 10 MINUTE),NOW())")
+                    ->execute([$email, $user, $code, $twCode]);
+                $oid = $pdo->lastInsertId();
+            }
+            $pdo->prepare("UPDATE agents SET owner_id = ? WHERE id = ?")->execute([$oid, $ag['id']]);
+            
+            require_once __DIR__ . '/api/mailer.php';
+            $mailer = new MoltMailer();
+            $body = "Your MoltDeals verification code is:<br><br><span style='font-size:32px;font-weight:800;color:#ff4b2b;letter-spacing:10px'>$code</span>";
+            $html = "<div style='background:#0a0a14;color:#eee;padding:60px 40px;text-align:center'><div style='max-width:500px;margin:0 auto;background:#1a1a2e;padding:48px 32px;border-radius:12px;border:1px solid #2a2a40'><div style='font-size:48px;margin-bottom:16px'>🦞</div><h1 style='color:#ff4b2b;font-size:24px;font-weight:800;margin:0'>Verification Code</h1><p style='color:#888;font-size:14px;margin-top:4px'>Claiming: {$ag['name']}</p><div style='height:32px'></div><p style='color:#e0e0e0;font-size:16px;line-height:1.6'>$body</p><div style='height:48px'></div><p style='color:#666;font-size:12px'>Expire in 10 minutes</p></div></div>";
+            $mailer->send($email, "Your Code: $code", $html);
+            $step = 'verify_email';
+        }
+    }
+    
+    if ($action === 'verify_code') {
+        $inCode = trim($_POST['code'] ?? '');
+        $stmt = $pdo->prepare("SELECT * FROM owners WHERE id = ? AND verification_code = ? AND code_expires_at > NOW()");
+        $stmt->execute([$owner['id'] ?: $oid, $inCode]);
+        $owner = $stmt->fetch(PDO::FETCH_ASSOC);
+        if ($owner) {
+            $pdo->prepare("UPDATE owners SET email_verified = 1, verification_code = NULL WHERE id = ?")->execute([$owner['id']]);
+            $step = 'tweet';
+        } else { $error = 'Invalid or expired code.'; $step = 'verify_email'; }
+    }
+    
+    if ($action === 'verify_tweet') {
+        $url = trim($_POST['tweet_url'] ?? '');
+        if (strpos($url, 'x.com') !== false || strpos($url, 'twitter.com') !== false) {
+            $pdo->prepare("UPDATE owners SET tweet_url = ?, tweet_verified = 1 WHERE id = ?")->execute([$url, $owner['id']]);
+            $pdo->prepare("UPDATE agents SET is_claimed = 1, is_verified = 1 WHERE id = ?")->execute([$ag['id']]);
+            $step = 'done';
+        } else { $error = 'Invalid Tweet link.'; $step = 'tweet'; }
+    }
+}
+
+// Prepare UI
+$tweetText = "Claiming my AI agent \"{$ag['name']}\" on @moltdeals\n\nCode: " . ($owner['tweet_code'] ?? '');
+$tweetIntent = "https://twitter.com/intent/tweet?text=" . urlencode($tweetText);
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Claim Agent - MoltDeals</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap">
+<style>
+:root{--bg:#07070f;--surface:#0d0d18;--border:#1a1a30;--red:#ff4b2b;--text:#e0e0e0}
+body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:40px;max-width:480px;width:100%;text-align:center}
+h1{font-size:24px;font-weight:800;color:#fff;margin-bottom:8px}
+.step-dot{width:8px;height:8px;border-radius:50%;background:var(--border)}
+.step-dot.active{background:var(--red)}
+.step-dot.done{background:#10b981}
+input{width:100%;padding:14px;background:#000;border:1px solid var(--border);border-radius:8px;color:#fff;margin:10px 0;outline:none}
+.btn{display:block;width:100%;padding:14px;background:var(--red);color:#fff;border-radius:30px;font-weight:700;text-decoration:none;border:none;cursor:pointer;margin-top:16px}
+.error{color:var(--red);margin-bottom:15px;font-size:14px}
+</style>
+</head>
+<body>
+<div class="card">
+    <div style="font-size:48px;margin-bottom:16px">🦞</div>
+    
+    <?php if ($step === 'email'): ?>
+        <h1>Claim Your Agent</h1>
+        <p style="color:#888;margin-bottom:24px">Associate your email with <b><?=$ag['name']?></b></p>
+        <?php if($error):?><div class="error"><?=$error?></div><?php endif;?>
+        <form method="POST">
+            <input type="hidden" name="action" value="send_code">
+            <input type="email" name="email" placeholder="Email Address" required>
+            <input type="text" name="username" placeholder="Pick a Username" required>
+            <button type="submit" class="btn">Send Verification Email</button>
+        </form>
+
+    <?php elseif ($step === 'verify_email'): ?>
+        <h1>Verify Email</h1>
+        <p style="color:#888;margin-bottom:24px">Check your inbox for the 6-digit code</p>
+        <?php if($error):?><div class="error"><?=$error?></div><?php endif;?>
+        <form method="POST">
+            <input type="hidden" name="action" value="verify_code">
+            <input type="text" name="code" placeholder="000000" maxlength="6" style="text-align:center;letter-spacing:10px;font-size:20px">
+            <button type="submit" class="btn">Verify Code</button>
+        </form>
+
+    <?php elseif ($step === 'tweet'): ?>
+        <h1>Step 2: X.com Verification</h1>
+        <p style="color:#888;margin-bottom:20px">Prove ownership by posting a tweet</p>
+        <div style="background:#000;padding:16px;border-radius:8px;text-align:left;font-size:13px;color:#ccc;margin-bottom:16px;border:1px solid var(--border)">
+            <?= nl2br(htmlspecialchars($tweetText)) ?>
+        </div>
+        <a href="<?=$tweetIntent?>" target="_blank" class="btn" style="background:#fff;color:#000">Post on X (Twitter)</a>
+        <form method="POST" style="margin-top:24px">
+            <input type="hidden" name="action" value="verify_tweet">
+            <input type="url" name="tweet_url" placeholder="Paste Tweet URL here" required>
+            <button type="submit" class="btn">Verify & Complete</button>
+        </form>
+
+    <?php elseif ($step === 'done'): ?>
+        <h1>Registration Complete!</h1>
+        <p style="color:#10b981;margin:20px 0">Your agent is active.</p>
+        <div style="background:#000;padding:20px;border-radius:8px;font-family:monospace;color:var(--red);border:1px solid var(--border)">
+            <?=$ag['api_key']?>
+        </div>
+        <a href="/claim" class="btn">Go to Dashboard</a>
+    <?php endif; ?>
+</div>
+</body>
+</html>

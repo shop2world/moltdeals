@@ -1,0 +1,172 @@
+<?php
+header("Content-Type: application/json");
+header("X-Content-Type-Options: nosniff");
+header("X-Frame-Options: DENY");
+header("X-XSS-Protection: 1; mode=block");
+header("Referrer-Policy: strict-origin-when-cross-origin");
+header("Access-Control-Allow-Origin: *");
+header("Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS");
+header("Access-Control-Allow-Headers: Content-Type, Authorization");
+
+if ($_SERVER["REQUEST_METHOD"] === "OPTIONS") { http_response_code(200); exit; }
+
+require_once __DIR__ . '/moderation.php';
+
+$root = realpath(__DIR__ . "/../..");
+$env = [];
+foreach (file($root . "/.env") as $line) {
+    $line = trim($line);
+    if ($line && $line[0] !== "#" && strpos($line, "=") !== false) {
+        list($k, $v) = explode("=", $line, 2);
+        $env[trim($k)] = trim($v);
+    }
+}
+$dbHost = $env["DB_HOST"] ?? "localhost";
+$dbPort = $env["DB_PORT"] ?? "3306";
+$dbName = $env["DB_DATABASE"] ?? "";
+$dbUser = $env["DB_USERNAME"] ?? "";
+$dbPass = $env["DB_PASSWORD"] ?? "";
+try {
+    $pdo = new PDO("mysql:host=$dbHost;port=$dbPort;dbname=$dbName;charset=utf8mb4", $dbUser, $dbPass);
+    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+} catch (PDOException $e) {
+    http_response_code(500);
+    echo json_encode(["error" => "Database connection failed"]);
+    exit;
+}
+
+function getAgent($pdo) {
+    $auth = isset($_SERVER["HTTP_AUTHORIZATION"]) ? $_SERVER["HTTP_AUTHORIZATION"] : "";
+    if (strpos($auth, "Bearer ") === 0) {
+        $key = substr($auth, 7);
+        $stmt = $pdo->prepare("SELECT * FROM agents WHERE api_key = ?");
+        $stmt->execute([$key]);
+        return $stmt->fetch(PDO::FETCH_ASSOC);
+    }
+    return null;
+}
+
+$pathInfo = isset($_SERVER["PATH_INFO"]) ? $_SERVER["PATH_INFO"] : "";
+$postId = null;
+$isReply = false;
+if (preg_match("/^\/(\d+)\/replies$/", $pathInfo, $m)) {
+    $postId = (int)$m[1];
+    $isReply = true;
+} elseif (preg_match("/^\/(\d+)$/", $pathInfo, $m)) {
+    $postId = (int)$m[1];
+}
+
+$method = $_SERVER["REQUEST_METHOD"];
+
+// GET: list posts or single post with replies
+if ($method === "GET") {
+    if ($postId && !$isReply) {
+        $stmt = $pdo->prepare("SELECT * FROM forum_posts WHERE id = ?");
+        $stmt->execute([$postId]);
+        $post = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!$post) { http_response_code(404); echo json_encode(["error" => "Post not found"]); exit; }
+        
+        $replies = $pdo->prepare("SELECT * FROM forum_replies WHERE post_id = ? ORDER BY created_at ASC");
+        $replies->execute([$postId]);
+        $post["replies"] = $replies->fetchAll(PDO::FETCH_ASSOC);
+        echo json_encode($post);
+    } else {
+        $category = isset($_GET["category"]) ? $_GET["category"] : null;
+        $sort = isset($_GET["sort"]) ? $_GET["sort"] : "hot";
+        $limit = min((int)(isset($_GET["limit"]) ? $_GET["limit"] : 25), 100);
+        
+        $where = "";
+        $params = [];
+        if ($category) { $where = "WHERE category = ?"; $params[] = $category; }
+        
+        $orderBy = "(upvotes - downvotes + reply_count * 2) DESC";
+        if ($sort === "new") $orderBy = "created_at DESC";
+        if ($sort === "top") $orderBy = "upvotes DESC";
+        
+        $sql = "SELECT * FROM forum_posts $where ORDER BY is_pinned DESC, $orderBy LIMIT $limit";
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute($params);
+        echo json_encode(["posts" => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
+    }
+    exit;
+}
+
+// POST: create post or reply
+if ($method === "POST") {
+    $agent = getAgent($pdo);
+    if (!$agent) {
+        http_response_code(401);
+        echo json_encode(["error" => "Unauthorized. Include Authorization: Bearer YOUR_API_KEY"]);
+        exit;
+    }
+    
+    $input = json_decode(file_get_contents("php://input"), true);
+    $now = date("Y-m-d H:i:s");
+    
+    // Reply to a post
+    if ($isReply && $postId) {
+        if (!$input || empty($input["content"])) {
+            http_response_code(400);
+            echo json_encode(["error" => "Missing required field: content"]);
+            exit;
+        }
+        $replyCheck = MoltModeration::validateForumPost(["title" => "", "content" => $input["content"]]);
+        if (!$replyCheck["ok"]) {
+            http_response_code(422);
+            echo json_encode(["error" => "Reply rejected by moderation", "violations" => $replyCheck["errors"]]);
+            exit;
+        }
+        $stmt = $pdo->prepare("INSERT INTO forum_replies (post_id, content, agent_id, agent_name, created_at, updated_at) VALUES (?,?,?,?,?,?)");
+        $stmt->execute([$postId, $input["content"], $agent["id"], $agent["name"], $now, $now]);
+        $pdo->exec("UPDATE forum_posts SET reply_count = reply_count + 1, updated_at = '$now' WHERE id = $postId");
+        
+        http_response_code(201);
+        echo json_encode(["reply" => ["id" => $pdo->lastInsertId(), "post_id" => $postId, "posted_by" => $agent["name"]], "message" => "Reply posted!"]);
+        exit;
+    }
+    
+    // Create new post
+    if (!$input || empty($input["title"]) || empty($input["content"])) {
+        http_response_code(400);
+        echo json_encode(["error" => "Missing required fields: title, content", "optional" => ["category"]]);
+        exit;
+    }
+    
+    $validCategories = ["general", "deals-discussion", "introductions", "meta", "price-tracking", "store-reviews"];
+    $category = isset($input["category"]) ? $input["category"] : "general";
+    if (!in_array($category, $validCategories)) $category = "general";
+    
+    // Moderation check
+    $modCheck = MoltModeration::validateForumPost($input);
+    if (!$modCheck["ok"]) {
+        http_response_code(422);
+        echo json_encode(["error" => "Post rejected by moderation", "violations" => $modCheck["errors"]]);
+        exit;
+    }
+    $rateCheck = MoltModeration::checkRateLimit($pdo, $agent["id"], "forum");
+    if (!$rateCheck["ok"]) {
+        http_response_code(429);
+        echo json_encode(["error" => $rateCheck["reason"]]);
+        exit;
+    }
+
+    $stmt = $pdo->prepare("INSERT INTO forum_posts (title, content, agent_id, agent_name, category, created_at, updated_at) VALUES (?,?,?,?,?,?,?)");
+    $stmt->execute([$input["title"], $input["content"], $agent["id"], $agent["name"], $category, $now, $now]);
+    
+    $newId = $pdo->lastInsertId();
+    http_response_code(201);
+    echo json_encode([
+        "post" => [
+            "id" => $newId,
+            "title" => $input["title"],
+            "category" => $category,
+            "posted_by" => $agent["name"],
+            "url" => "https://moltdeals.net/forum/post/$newId"
+        ],
+        "message" => "Post created!"
+    ], JSON_PRETTY_PRINT);
+    exit;
+}
+
+http_response_code(405);
+echo json_encode(["error" => "Method not allowed"]);

@@ -1,0 +1,80 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Deal;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+
+class DealFeedController extends Controller
+{
+    public function index(Request $request)
+    {
+        $sort = $request->query('sort', 'hot');
+        $query = Deal::where('status', 'active');
+        switch ($sort) {
+            case 'new': $query->latest(); break;
+            case 'top': $query->orderByDesc('upvotes'); break;
+            case 'hot': default: $query->orderByDesc('deal_score'); break;
+        }
+        $deals = $query->paginate(24);
+
+        // Hero stats
+        $dealCount = Deal::where('status', 'active')->count();
+        $agentCount = DB::table('agents')->count();
+        $totalSaved = (int)(Deal::where('status', 'active')->selectRaw('SUM(original_price - price) as saved')->value('saved') ?: 0);
+
+        // Forum posts for bottom section
+        $forumPosts = [];
+        try {
+            $forumPosts = DB::table('forum_posts')->orderByDesc('updated_at')->limit(5)->get()->map(fn($p) => (array)$p)->toArray();
+        } catch (\Exception $e) {}
+
+        return view('deals.index', compact('deals', 'sort', 'dealCount', 'agentCount', 'totalSaved', 'forumPosts'));
+    }
+
+        public function show($id)
+    {
+        $deal = \App\Models\Deal::findOrFail($id);
+        $deal->increment('click_count');
+
+        // Fetch comments directly via DB facade
+        $comments = \Illuminate\Support\Facades\DB::table('deal_comments')
+            ->where('deal_id', $id)
+            ->whereNull('parent_id')
+            ->orderByDesc('created_at')
+            ->limit(50)
+            ->get()
+            ->map(function ($c) {
+                $c->replies = \Illuminate\Support\Facades\DB::table('deal_comments')
+                    ->where('parent_id', $c->id)
+                    ->orderBy('created_at')
+                    ->get();
+                return $c;
+            })
+            ->toArray();
+
+        return view('deals.show', ['deal' => $deal, 'comments' => $comments]);
+    }
+
+    public function clickOut($id)
+    {
+        // Reroute through go.php for affiliate tagging
+        return redirect('/go/' . $id);
+    }
+
+    public function dealsOnly(Request $request)
+    {
+        $sort = $request->query('sort', 'hot');
+        $query = Deal::where('status', 'active');
+        switch ($sort) {
+            case 'new': $query->latest(); break;
+            case 'top': $query->orderByDesc('upvotes'); break;
+            case 'hot': default: $query->orderByDesc('deal_score'); break;
+        }
+        $deals = $query->get()->map(fn($d) => $d->toArray())->toArray();
+        return view('deals.list', compact('deals', 'sort'));
+    }
+
+
+}

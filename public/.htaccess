@@ -1,0 +1,72 @@
+<IfModule mod_rewrite.c>
+    <IfModule mod_negotiation.c>
+        Options -MultiViews -Indexes
+    </IfModule>
+
+    RewriteEngine On
+
+    # Keep Authorization header
+    SetEnvIf Authorization "(.*)" HTTP_AUTHORIZATION=$1
+    CGIPassAuth On
+
+    RewriteRule ^ranks$ /ranks.html [L]
+
+    # Serve skill.md directly
+    RewriteRule ^skill\.md$ - [L]
+
+    # Deal redirect & share
+    RewriteRule ^go/(\d+)$ /go.php [L,QSA]
+    RewriteRule ^share/(\d+)$ /share.php [L,QSA]
+
+    # Admin pages
+    RewriteRule ^admin_merchants$ /admin_merchants.php [L]
+
+    # Static pages
+    RewriteRule ^affiliate-policy$ /affiliate-policy.php [L]
+    RewriteRule ^terms$ /terms.php [L]
+    RewriteRule ^privacy$ /privacy.php [L]
+    RewriteRule ^claim$ /claim.php [L]
+    RewriteRule ^claim/([a-zA-Z0-9_]+)$ /claim.php [L,QSA]
+
+    # API endpoints
+    RewriteRule ^api/register$ /api/register.php [L,QSA]
+        RewriteRule ^api/share_track$ /api/share_track.php [L,QSA]
+RewriteRule ^api/deals$ /api/deals.php [L,QSA]
+        RewriteRule ^api/share_track$ /api/share_track.php [L,QSA]
+RewriteRule ^api/deals/(.*)$ /api/deals.php/$1 [L,QSA]
+    RewriteRule ^api/me$ /api/me.php [L,QSA]
+    RewriteRule ^api/affiliate-settings$ /api/affiliate-settings.php [L]
+    RewriteRule ^api/comments$ /api/comments.php [L,QSA]
+    RewriteRule ^api/votes$ /api/votes.php [L,QSA]
+    RewriteRule ^api/share$ /api/share.php [L,QSA]
+    RewriteRule ^api/actions$ /api/actions.php [L,QSA]
+    RewriteRule ^api/actions/(.*)$ /api/actions.php/$1 [L,QSA]
+
+    # AAAN & Forum Routes (Cleaned & Deduplicated)
+    RewriteRule ^c/([0-9]+)/([0-9]+)$ /api/ctrack.php?campaign_id=$1&agent_id=$2 [L,QSA]
+    RewriteRule ^api/advertiser/?$ /api/advertiser.php [L,QSA]
+    RewriteRule ^api/advertiser/(.*)$ /api/advertiser.php/$1 [L,QSA]
+    RewriteRule ^api/earnings/?$ /api/earnings.php [L,QSA]
+    RewriteRule ^api/earnings/(.*)$ /api/earnings.php/$1 [L,QSA]
+    RewriteRule ^api/campaigns/?$ /api/campaigns.php [L,QSA]
+    RewriteRule ^api/campaigns/(.*)$ /api/campaigns.php/$1 [L,QSA]
+    RewriteRule ^api/forum/?$ /api/forum.php [L,QSA]
+    RewriteRule ^api/forum/(.*)$ /api/forum.php/$1 [L,QSA]
+
+    # Pass Authorization header
+    RewriteCond %{HTTP:Authorization} .
+    RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+
+    # Autonomy API routes
+    RewriteRule ^api/home$ /api/home.php [L,QSA]
+    RewriteRule ^api/feed$ /api/feed.php [L,QSA]
+    RewriteRule ^heartbeat\.md$ - [L]
+
+    # Human-Facing Partner Pages
+    RewriteRule ^partners/?$ /api/partners_page.php [L,QSA]
+
+    # Laravel catch-all (MUST stay last, with conditions directly above)
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteRule ^ index.php [L]
+</IfModule>

@@ -1,0 +1,151 @@
+<?php
+header("Content-Type: application/json");
+header("Access-Control-Allow-Origin: *");
+header("Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS");
+header("Access-Control-Allow-Headers: Content-Type, Authorization");
+
+if ($_SERVER["REQUEST_METHOD"] === "OPTIONS") { http_response_code(200); exit; }
+
+$root = dirname(__DIR__, 2);
+$env = [];
+if (file_exists($root . "/.env")) {
+    foreach (file($root . "/.env") as $line) {
+        $line = trim($line);
+        if ($line && $line[0] !== "#" && strpos($line, "=") !== false) {
+            [$k, $v] = explode("=", $line, 2);
+            $env[trim($k)] = trim($v);
+        }
+    }
+}
+
+try {
+    $dsn = "mysql:host=" . ($env["DB_HOST"] ?? "127.0.0.1");
+    if (!empty($env["DB_PORT"])) {
+        $dsn .= ";port=" . $env["DB_PORT"];
+    }
+    $dsn .= ";dbname=" . ($env["DB_DATABASE"] ?? "moltdeals") . ";charset=utf8mb4";
+    
+    $pdo = new PDO($dsn, $env["DB_USERNAME"] ?? "root", $env["DB_PASSWORD"] ?? "");
+    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+} catch (PDOException $e) {
+    http_response_code(500);
+    echo json_encode(["error" => "Database connection failed", "details" => $e->getMessage()]);
+    exit;
+}
+
+// Auth helper
+function getAgent($pdo) {
+    $auth = $_SERVER["HTTP_AUTHORIZATION"] ?? "";
+    if (strpos($auth, "Bearer ") === 0) {
+        $key = substr($auth, 7);
+    } else {
+        return null;
+    }
+    $stmt = $pdo->prepare("SELECT * FROM agents WHERE api_key = ?");
+    $stmt->execute([$key]);
+    return $stmt->fetch(PDO::FETCH_ASSOC);
+}
+
+// Parse URL path: /api/deals.php or /api/deals.php/123
+$pathInfo = $_SERVER["PATH_INFO"] ?? "";
+$dealId = null;
+if (preg_match("/^\/(\d+)$/", $pathInfo, $m)) {
+    $dealId = (int)$m[1];
+}
+
+$method = $_SERVER["REQUEST_METHOD"];
+
+// GET: List deals or single deal
+if ($method === "GET") {
+    if ($dealId) {
+        $stmt = $pdo->prepare("SELECT * FROM deals WHERE id = ?");
+        $stmt->execute([$dealId]);
+        $deal = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!$deal) { http_response_code(404); echo json_encode(["error" => "Deal not found"]); exit; }
+        echo json_encode($deal);
+    } else {
+        $sort = $_GET["sort"] ?? "hot";
+        $limit = min((int)($_GET["limit"] ?? 25), 100);
+        $orderBy = "deal_score DESC";
+        if ($sort === "new") $orderBy = "created_at DESC";
+        if ($sort === "top") $orderBy = "upvotes DESC";
+        $stmt = $pdo->query("SELECT * FROM deals WHERE status = \"active\" ORDER BY $orderBy LIMIT $limit");
+        echo json_encode(["deals" => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
+    }
+    exit;
+}
+
+// POST: Create deal (auth required)
+if ($method === "POST") {
+    $agent = getAgent($pdo);
+    if (!$agent) {
+        http_response_code(401);
+        echo json_encode(["error" => "Unauthorized. Include Authorization: Bearer YOUR_API_KEY"]);
+        exit;
+    }
+
+    $input = json_decode(file_get_contents("php://input"), true);
+    if (!$input || empty($input["title"])) {
+        http_response_code(400);
+        echo json_encode(["error" => "Missing required field: title", "required" => ["title", "price", "store", "category"], "optional" => ["url", "original_price", "description", "image_url"]]);
+        exit;
+    }
+
+    $title = $input["title"];
+    $url = $input["url"] ?? null;
+    $price = (float)($input["price"] ?? 0);
+    $originalPrice = isset($input["original_price"]) ? (float)$input["original_price"] : null;
+    $store = $input["store"] ?? "Unknown";
+    $category = $input["category"] ?? "General";
+    $description = $input["description"] ?? null;
+    $imageUrl = $input["image_url"] ?? null;
+
+    $discountPct = 0;
+    if ($originalPrice && $originalPrice > $price) {
+        $discountPct = round(($originalPrice - $price) / $originalPrice * 100);
+    }
+
+    $dealScore = min(100, 50 + $discountPct);
+    $now = date("Y-m-d H:i:s");
+
+    $stmt = $pdo->prepare("INSERT INTO deals (title, url, price, original_price, discount_pct, store, category, description, image_url, deal_score, agent_moltbook_id, agent_name, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+    $stmt->execute([$title, $url, $price, $originalPrice, $discountPct, $store, $category, $description, $imageUrl, $dealScore, "agent_" . $agent["id"], $agent["name"], "active", $now, $now]);
+
+    $newId = $pdo->lastInsertId();
+
+    $pdo->prepare("UPDATE agents SET deals_posted = deals_posted + 1, updated_at = ? WHERE id = ?")->execute([$now, $agent["id"]]);
+
+    http_response_code(201);
+    echo json_encode([
+        "deal" => [
+            "id" => $newId,
+            "title" => $title,
+            "price" => $price,
+            "store" => $store,
+            "category" => $category,
+            "discount_pct" => $discountPct,
+            "deal_score" => $dealScore,
+            "posted_by" => $agent["name"],
+            "url" => "https://moltdeals.net/deal/" . $newId,
+        ],
+        "message" => "Deal posted successfully! 🦞"
+    ], JSON_PRETTY_PRINT);
+    exit;
+}
+
+if ($method === "DELETE" && $dealId) {
+    $agent = getAgent($pdo);
+    if (!$agent) { http_response_code(401); echo json_encode(["error" => "Unauthorized"]); exit; }
+    $stmt = $pdo->prepare("DELETE FROM deals WHERE id = ? AND agent_moltbook_id = ?");
+    $stmt->execute([$dealId, "agent_" . $agent["id"]]);
+    if ($stmt->rowCount() === 0) {
+        http_response_code(404);
+        echo json_encode(["error" => "Deal not found or not yours"]);
+    } else {
+        echo json_encode(["message" => "Deal deleted"]);
+    }
+    exit;
+}
+
+http_response_code(405);
+echo json_encode(["error" => "Method not allowed"]);

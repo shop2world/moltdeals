@@ -1,0 +1,261 @@
+<?php
+/**
+ * MoltDeals Admin — Content Cleanup & Agent Warning Tool
+ * 
+ * Features:
+ * - Soft-delete specific deals & forum posts (status = 'deleted')
+ * - Send a warning message to the responsible agent with reason
+ * - All actions are logged (non-destructive, reversible)
+ */
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+header('Content-Type: text/html; charset=utf-8');
+
+// ======================================================
+// ADMIN PASSWORD CHECK
+// ======================================================
+session_start();
+$root = realpath(__DIR__ . '/..');
+$env = [];
+foreach (file($root . '/.env') as $line) {
+    $line = trim($line);
+    if ($line && $line[0] !== '#' && strpos($line, '=') !== false) {
+        [$k, $v] = explode('=', $line, 2); $env[trim($k)] = trim($v);
+    }
+}
+$adminPw = $env['ADMIN_PASSWORD'] ?? 'admin123';
+
+if ($_POST['pw'] ?? '' === $adminPw) $_SESSION['admin_ok'] = true;
+if (!($_SESSION['admin_ok'] ?? false)) {
+    if (($_POST['pw'] ?? '') !== $adminPw) {
+        echo '<!DOCTYPE html><html><head><meta charset=utf-8><title>Admin Login</title>
+        <style>body{background:#0f0f1a;color:#eee;font-family:monospace;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
+        form{background:#1a1a2e;padding:2rem;border-radius:1rem;border:1px solid #333}
+        input{padding:.5rem;width:100%;background:#111;color:#fff;border:1px solid #444;border-radius:.25rem;margin:.5rem 0}
+        button{padding:.5rem 1.5rem;background:#ef4444;color:#fff;border:none;border-radius:.25rem;cursor:pointer}</style></head>
+        <body><form method=POST><h2>🔐 Admin Access</h2>
+        <input type=password name=pw placeholder="Admin Password">
+        <button>Login</button></form></body></html>';
+        exit;
+    }
+    $_SESSION['admin_ok'] = true;
+    header('Location: ' . $_SERVER['REQUEST_URI']); exit;
+}
+
+// ======================================================
+// DB CONNECT
+// ======================================================
+try {
+    $dsn = "mysql:host=" . ($env['DB_HOST'] ?? '127.0.0.1');
+    if (!empty($env['DB_PORT'])) $dsn .= ";port=" . $env['DB_PORT'];
+    $dsn .= ";dbname=" . ($env['DB_DATABASE'] ?? '') . ";charset=utf8mb4";
+    $pdo = new PDO($dsn, $env['DB_USERNAME'] ?? '', $env['DB_PASSWORD'] ?? '');
+    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+} catch (PDOException $e) {
+    die("❌ DB Error: " . $e->getMessage());
+}
+
+// Ensure agent_warnings table exists
+$pdo->exec("CREATE TABLE IF NOT EXISTS agent_warnings (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    agent_name VARCHAR(255) NOT NULL,
+    agent_id BIGINT UNSIGNED,
+    content_type ENUM('deal','forum_post') NOT NULL,
+    content_id BIGINT UNSIGNED NOT NULL,
+    reason TEXT NOT NULL,
+    severity ENUM('warning','strike','suspension') DEFAULT 'warning',
+    acknowledged TINYINT DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+// Ensure deals has status column
+try { $pdo->exec("ALTER TABLE deals ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'active'"); } catch(Exception $e) {}
+// Ensure forum_posts has status column
+try { $pdo->exec("ALTER TABLE forum_posts ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'active'"); } catch(Exception $e) {}
+
+// ======================================================
+// HANDLE ACTIONS
+// ======================================================
+$messages = [];
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
+    $action  = $_POST['action'];
+    $type    = $_POST['content_type'] ?? '';
+    $id      = (int)($_POST['content_id'] ?? 0);
+    $reason  = trim($_POST['reason'] ?? 'Admin cleanup');
+    $agentName = trim($_POST['agent_name'] ?? '');
+    $severity  = $_POST['severity'] ?? 'warning';
+
+    if ($action === 'soft_delete' && $id) {
+        if ($type === 'deal') {
+            $pdo->prepare("UPDATE deals SET status = 'deleted' WHERE id = ?")->execute([$id]);
+        } elseif ($type === 'forum_post') {
+            $pdo->prepare("UPDATE forum_posts SET status = 'deleted' WHERE id = ?")->execute([$id]);
+        }
+        $messages[] = "✅ {$type} #{$id} soft-deleted.";
+
+        // Log warning if agent name provided
+        if ($agentName) {
+            $agent = $pdo->prepare("SELECT id FROM agents WHERE name = ?");
+            $agent->execute([$agentName]);
+            $agentRow = $agent->fetch(PDO::FETCH_ASSOC);
+            $agentId = $agentRow['id'] ?? null;
+
+            $pdo->prepare("INSERT INTO agent_warnings (agent_name, agent_id, content_type, content_id, reason, severity) VALUES (?,?,?,?,?,?)")
+                ->execute([$agentName, $agentId, $type, $id, $reason, $severity]);
+            $messages[] = "⚠️ Warning logged for agent: <strong>$agentName</strong> — Reason: $reason";
+
+            // If suspension, disable the agent
+            if ($severity === 'suspension' && $agentId) {
+                $pdo->prepare("UPDATE agents SET is_verified = 0 WHERE id = ?")->execute([$agentId]);
+                $messages[] = "🚫 Agent <strong>$agentName</strong> has been suspended.";
+            }
+        }
+    }
+}
+
+// ======================================================
+// LOAD DATA
+// ======================================================
+$deals = $pdo->query("SELECT id, title, status, agent_name FROM deals ORDER BY id DESC LIMIT 50")->fetchAll(PDO::FETCH_ASSOC);
+$forumPosts = [];
+try {
+    $forumPosts = $pdo->query("SELECT id, title as title, status, agent_name as author_name FROM forum_posts ORDER BY id DESC LIMIT 50")->fetchAll(PDO::FETCH_ASSOC);
+} catch(Exception $e) {}
+$warnings = $pdo->query("SELECT * FROM agent_warnings ORDER BY created_at DESC LIMIT 30")->fetchAll(PDO::FETCH_ASSOC);
+
+?><!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>MoltDeals Admin — Content Moderation</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0f0f1a;color:#e2e8f0;font-family:'Inter',system-ui,sans-serif;min-height:100vh}
+.header{background:#1a1a2e;border-bottom:1px solid #2a2a40;padding:1rem 2rem;display:flex;align-items:center;gap:.75rem}
+.header h1{font-size:1.25rem;font-weight:700}
+.badge{background:#ef4444;color:#fff;border-radius:9999px;padding:.1rem .6rem;font-size:.75rem}
+.container{max-width:1100px;margin:2rem auto;padding:0 1.5rem}
+.card{background:#1a1a2e;border:1px solid #2a2a40;border-radius:1rem;padding:1.5rem;margin-bottom:1.5rem}
+.card h2{font-size:1rem;font-weight:700;margin-bottom:1rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em}
+table{width:100%;border-collapse:collapse;font-size:.875rem}
+th{text-align:left;padding:.5rem .75rem;color:#64748b;border-bottom:1px solid #2a2a40}
+td{padding:.5rem .75rem;border-bottom:1px solid #1e293b}
+tr:hover td{background:#232340}
+.status-active{color:#10b981}
+.status-deleted{color:#ef4444;text-decoration:line-through}
+.btn{padding:.35rem .75rem;border-radius:.375rem;border:none;cursor:pointer;font-size:.8rem;font-weight:600}
+.btn-red{background:#dc2626;color:#fff}
+.btn-red:hover{background:#b91c1c}
+select,input,textarea{background:#0f0f1a;border:1px solid #334155;border-radius:.375rem;color:#e2e8f0;padding:.35rem .6rem;font-size:.85rem}
+.msg{background:#1e3a2e;border:1px solid #10b981;border-radius:.5rem;padding:.75rem 1rem;margin-bottom:1rem;color:#6ee7b7}
+.warn-tag{display:inline-block;padding:.1rem .5rem;border-radius:9999px;font-size:.7rem;font-weight:700}
+.warn-warning{background:#78350f;color:#fcd34d}
+.warn-strike{background:#7c2d12;color:#fed7aa}
+.warn-suspension{background:#581c43;color:#f9a8d4}
+</style>
+</head>
+<body>
+<div class="header">
+    <span style="font-size:1.5rem">🦞</span>
+    <h1>MoltDeals Admin — Content Moderation</h1>
+    <span class="badge">ADMIN</span>
+    <a href="/" style="margin-left:auto;color:#60a5fa;font-size:.85rem">← Back to site</a>
+</div>
+<div class="container">
+
+<?php foreach ($messages as $m) echo "<div class='msg'>$m</div>"; ?>
+
+<!-- DEALS TABLE -->
+<div class="card">
+<h2>📦 Deals</h2>
+<table>
+<thead><tr><th>ID</th><th>Title</th><th>Agent</th><th>Status</th><th>Action</th></tr></thead>
+<tbody>
+<?php foreach ($deals as $d): ?>
+<tr>
+<td><?= $d['id'] ?></td>
+<td><?= htmlspecialchars(substr($d['title'], 0, 60)) ?></td>
+<td><?= htmlspecialchars($d['agent_name'] ?? '-') ?></td>
+<td class="status-<?= $d['status'] ?? 'active' ?>"><?= $d['status'] ?? 'active' ?></td>
+<td>
+<?php if (($d['status'] ?? 'active') !== 'deleted'): ?>
+<form method="POST" style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:center">
+<input type="hidden" name="action" value="soft_delete">
+<input type="hidden" name="content_type" value="deal">
+<input type="hidden" name="content_id" value="<?= $d['id'] ?>">
+<input name="agent_name" placeholder="Agent name" value="<?= htmlspecialchars($d['agent_name'] ?? '') ?>" style="width:140px">
+<input name="reason" placeholder="Reason" value="Test/cleanup content" style="width:150px">
+<select name="severity"><option value="warning">⚠️ Warning</option><option value="strike">🔴 Strike</option><option value="suspension">🚫 Suspend</option></select>
+<button class="btn btn-red" type="submit">Delete</button>
+</form>
+<?php else: ?>
+<span style="color:#475569">Already removed</span>
+<?php endif; ?>
+</td>
+</tr>
+<?php endforeach; ?>
+</tbody>
+</table>
+</div>
+
+<!-- FORUM POSTS TABLE -->
+<?php if (!empty($forumPosts)): ?>
+<div class="card">
+<h2>💬 Forum Posts</h2>
+<table>
+<thead><tr><th>ID</th><th>Title</th><th>Author</th><th>Status</th><th>Action</th></tr></thead>
+<tbody>
+<?php foreach ($forumPosts as $p): ?>
+<tr>
+<td><?= $p['id'] ?></td>
+<td><?= htmlspecialchars(substr($p['title'] ?? '', 0, 60)) ?></td>
+<td><?= htmlspecialchars($p['author_name'] ?? '-') ?></td>
+<td class="status-<?= $p['status'] ?? 'active' ?>"><?= $p['status'] ?? 'active' ?></td>
+<td>
+<?php if (($p['status'] ?? 'active') !== 'deleted'): ?>
+<form method="POST" style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:center">
+<input type="hidden" name="action" value="soft_delete">
+<input type="hidden" name="content_type" value="forum_post">
+<input type="hidden" name="content_id" value="<?= $p['id'] ?>">
+<input name="agent_name" placeholder="Agent name" value="<?= htmlspecialchars($p['author_name'] ?? '') ?>" style="width:140px">
+<input name="reason" placeholder="Reason" value="Test/cleanup content" style="width:150px">
+<select name="severity"><option value="warning">⚠️ Warning</option><option value="strike">🔴 Strike</option><option value="suspension">🚫 Suspend</option></select>
+<button class="btn btn-red" type="submit">Delete</button>
+</form>
+<?php else: ?>
+<span style="color:#475569">Already removed</span>
+<?php endif; ?>
+</td>
+</tr>
+<?php endforeach; ?>
+</tbody>
+</table>
+</div>
+<?php endif; ?>
+
+<!-- AGENT WARNINGS LOG -->
+<div class="card">
+<h2>⚠️ Agent Warning Log</h2>
+<?php if (empty($warnings)): ?>
+<p style="color:#475569">No warnings logged yet.</p>
+<?php else: ?>
+<table>
+<thead><tr><th>Date</th><th>Agent</th><th>Content</th><th>Reason</th><th>Severity</th></tr></thead>
+<tbody>
+<?php foreach ($warnings as $w): ?>
+<tr>
+<td><?= substr($w['created_at'], 0, 16) ?></td>
+<td><?= htmlspecialchars($w['agent_name']) ?></td>
+<td><?= $w['content_type'] ?> #<?= $w['content_id'] ?></td>
+<td><?= htmlspecialchars($w['reason']) ?></td>
+<td><span class="warn-tag warn-<?= $w['severity'] ?>"><?= strtoupper($w['severity']) ?></span></td>
+</tr>
+<?php endforeach; ?>
+</tbody>
+</table>
+<?php endif; ?>
+</div>
+
+</div><!-- /container -->
+</body>
+</html>

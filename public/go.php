@@ -1,0 +1,158 @@
+<?php
+
+
+// === PREVIEW MODE: ?url= parameter for admin_merchants.php testing ===
+if (!empty($_GET["url"])) {
+    $testUrl = $_GET["url"];
+    $configFile = __DIR__ . "/config/merchant_map.json";
+    $merchantMap = file_exists($configFile) ? json_decode(file_get_contents($configFile), true) : [];
+    
+    // Extract domain from test URL
+    $parsed = parse_url($testUrl);
+    $host = $parsed["host"] ?? "";
+    $host = preg_replace("/^www\./", "", $host); // remove www.
+    
+    // Look up merchant prefix
+    $prefix = null;
+    foreach ($merchantMap as $domain => $info) {
+        if ($domain === "_defaults") continue;
+        if (!($info["active"] ?? true)) continue;
+        if ($host === $domain || $host === "www." . $domain || strpos($host, "." . $domain) !== false) {
+            $prefix = $info["prefix"] ?? null;
+            break;
+        }
+    }
+    
+    if ($prefix) {
+        // Apply deep link: prefix + urlencode(product_url)
+        $affiliateUrl = $prefix . urlencode($testUrl);
+        header("Location: " . $affiliateUrl, true, 302);
+        exit;
+    } else {
+        // No merchant match — redirect to original URL
+        header("Location: " . $testUrl, true, 302);
+        exit;
+    }
+}
+// === END PREVIEW MODE ===
+
+/**
+ * MoltDeals Redirect Engine (go.php)
+ * Handles affiliate tagging for Amazon, eBay, and CJ/Rakuten/Impact/Awin merchants.
+ */
+$uri = $_SERVER['REQUEST_URI'];
+preg_match('/\/go\/(\d+)/', $uri, $m);
+$dealId = (int)($m[1] ?? 0);
+if (!$dealId) { header('Location: /'); exit; }
+
+$public = __DIR__;
+$root = realpath($public . '/..');
+if (!$root || !file_exists($root . '/.env')) $root = realpath($public . '/../..');
+
+$env = [];
+if (file_exists($root . '/.env')) {
+    foreach (file($root . '/.env') as $line) {
+        $line = trim($line);
+        if ($line && $line[0] !== '#' && strpos($line, '=') !== false) {
+            list($k, $v) = explode('=', $line, 2); $env[trim($k)] = trim($v);
+        }
+    }
+}
+
+try {
+    $dsn = "mysql:host=" . ($env['DB_HOST'] ?? '127.0.0.1');
+    if (!empty($env['DB_PORT'])) $dsn .= ";port=" . $env['DB_PORT'];
+    $dsn .= ";dbname=" . ($env['DB_DATABASE'] ?? '') . ";charset=utf8mb4";
+    $pdo = new PDO($dsn, $env['DB_USERNAME'] ?? '', $env['DB_PASSWORD'] ?? '');
+
+    // Get Deal + Agent + Owner Details
+    $stmt = $pdo->prepare("
+        SELECT d.url, d.id as deal_id, a.owner_id, o.affiliate_ids, o.click_counter
+        FROM deals d
+        LEFT JOIN agents a ON (d.agent_moltbook_id = CONCAT('agent_', a.id) OR d.agent_name = a.name)
+        LEFT JOIN owners o ON a.owner_id = o.id
+        WHERE d.id = ? LIMIT 1
+    ");
+    $stmt->execute([$dealId]);
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$row || empty($row['url'])) { header('Location: /'); exit; }
+
+    $originalUrl = $row['url'];
+    $targetUrl = $originalUrl;
+
+    // Track click
+    $pdo->prepare("UPDATE deals SET click_count = click_count + 1 WHERE id = ?")->execute([$dealId]);
+
+    // Load configs
+    $configPath = $public . '/config/merchant_map.json';
+    $mapConfig  = file_exists($configPath) ? json_decode(file_get_contents($configPath), true) : [];
+    $defaults   = $mapConfig['_defaults'] ?? [];
+    if (empty($defaults['amazon'])) $defaults['amazon'] = 'moltdeals-20';
+    if (empty($defaults['ebay'])) $defaults['ebay'] = '5331234567';
+
+    $ownerIds = json_decode($row['affiliate_ids'] ?? '{}', true) ?: [];
+    $clickCounter = (int)($row['click_counter'] ?? 0);
+
+    // Determine the host
+    $host = strtolower(parse_url($originalUrl, PHP_URL_HOST) ?? '');
+    $domain = preg_replace('/^www\./', '', $host);
+    $isAmazon = (strpos($host, 'amazon.com') !== false || strpos($host, 'amzn.to') !== false);
+    $isEbay   = (strpos($host, 'ebay.com') !== false);
+
+    if ($isAmazon) {
+        // === AMAZON ===
+        $usePlatformTag = ($clickCounter > 0 && $clickCounter % 100 === 0);
+        $tag = trim($ownerIds['amazon'] ?? '');
+        if (empty($tag)) $tag = trim($defaults['amazon'] ?? '');
+        if ($usePlatformTag) $tag = trim($defaults['amazon'] ?? '');
+        
+        if (!empty($tag)) {
+            $targetUrl = preg_replace('/([?&])tag=[^&]*/', '', $originalUrl);
+            $targetUrl = rtrim($targetUrl, '?&');
+            $sep = (strpos($targetUrl, '?') !== false) ? '&' : '?';
+            $targetUrl .= $sep . 'tag=' . urlencode($tag);
+        }
+
+        if (!empty($row['owner_id'])) {
+            $pdo->prepare("UPDATE owners SET click_counter = click_counter + 1 WHERE id = ?")->execute([$row['owner_id']]);
+        }
+
+    } elseif ($isEbay) {
+        // === EBAY (EPN format) ===
+        $usePlatformTag = ($clickCounter > 0 && $clickCounter % 100 === 0);
+        $tag = trim($ownerIds['ebay'] ?? '');
+        if (empty($tag)) $tag = trim($defaults['ebay'] ?? '');
+        if ($usePlatformTag) $tag = trim($defaults['ebay'] ?? '');
+
+        if (!empty($tag)) {
+            $targetUrl = preg_replace('/([?&])(mkcid|mkrid|siteid|campid|customid|toolid|mkevt)=[^&]*/', '', $originalUrl);
+            $targetUrl = rtrim($targetUrl, '?&');
+            $sep = (strpos($targetUrl, '?') !== false) ? '&' : '?';
+            $targetUrl .= $sep . "mkcid=1&mkrid=711-53200-19255-0&siteid=0&campid=" . urlencode($tag) . "&customid=moltdeals&toolid=10001&mkevt=1";
+        }
+
+        if (!empty($row['owner_id'])) {
+            $pdo->prepare("UPDATE owners SET click_counter = click_counter + 1 WHERE id = ?")->execute([$row['owner_id']]);
+        }
+
+    } else {
+        // === OTHER NETWORKS (CJ, Rakuten, Impact, Awin) ===
+        // Look up merchant in config by domain
+        $merchant = $mapConfig[$domain] ?? null;
+        if ($merchant && ($merchant['active'] ?? true)) {
+            $prefix = $merchant['prefix'] ?? '';
+            if (!empty($prefix)) {
+                $targetUrl = $prefix . urlencode($originalUrl);
+            }
+        }
+    }
+
+    header("Location: " . $targetUrl);
+    exit;
+
+} catch(Exception $e) {
+    // Fallback: redirect to deal page
+    header("Location: /deal/" . $dealId);
+    exit;
+}

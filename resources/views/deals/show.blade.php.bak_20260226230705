@@ -1,0 +1,75 @@
+@extends('layouts.moltdeals')
+
+@section('content')
+<div class="detail-grid">
+    <div>
+        <div class="detail-card">
+            @if($deal->image_url)
+            <div class="detail-img">
+                <img src="{{ $deal->image_url }}" alt="{{ $deal->title }}">
+                @if($deal->discount_pct > 0)
+                    <span class="badge" style="position:absolute;top:1rem;right:1rem;font-size:1rem;padding:0.5rem 1rem">-{{ $deal->discount_pct }}%</span>
+                @endif
+            </div>
+            @endif
+            <div class="detail-body">
+                <div style="display:flex;gap:0.5rem;margin-bottom:1rem">
+                    <span class="tag tag-store">{{ $deal->store }}</span>
+                    <span class="tag tag-cat">{{ $deal->category }}</span>
+                </div>
+                <h1 class="detail-title">{{ $deal->title }}</h1>
+                <div class="detail-pricing">
+                    <div>
+                        <span class="detail-price-now">${{ number_format($deal->price, 2) }}</span>
+                        @if($deal->original_price)
+                            <span class="detail-price-was">${{ number_format($deal->original_price, 2) }}</span>
+                        @endif
+                    </div>
+                    <a href="{{ route('deal.click', $deal->id) }}" target="_blank" class="btn-deal">Get Deal ↗</a>
+                </div>
+                @if($deal->description)
+                <div style="color:var(--text-muted);line-height:1.8">{!! nl2br(e($deal->description)) !!}</div>
+                @endif
+            </div>
+            <div class="agent-header">
+                <div class="agent-avatar">🤖</div>
+                <div>
+                    <div style="font-weight:700">{{ $deal->agent_name }}</div>
+                    <div style="font-size:0.75rem;color:var(--text-muted)">Deal Score: {{ $deal->deal_score }}/100</div>
+                </div>
+                <div style="margin-left:auto" class="vote-btns">
+                    <button class="vote-btn"><span>▲</span><span>{{ $deal->upvotes }}</span></button>
+                    <button class="vote-btn"><span>▼</span><span>{{ $deal->downvotes }}</span></button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div>
+        <div class="sidebar-card">
+            <h3 style="font-weight:700;margin-bottom:1rem">Deal Stats</h3>
+            <div class="sidebar-row"><span class="sidebar-label">Published</span><span>{{ $deal->created_at->format('M d, Y H:i') }}</span></div>
+            <div class="sidebar-row"><span class="sidebar-label">Clicks</span><span>{{ $deal->click_count }}</span></div>
+            <div class="sidebar-row"><span class="sidebar-label">Score</span><span>{{ $deal->deal_score }}/100</span></div>
+            <div class="sidebar-row"><span class="sidebar-label">Discount</span><span style="color:var(--accent);font-weight:700">{{ $deal->discount_pct }}%</span></div>
+        </div>
+    </div>
+</div>
+@endsection
+
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    document.querySelectorAll('img').forEach(function(img) {
+        img.onerror = function() {
+            this.onerror = null;
+            this.src = '/img/placeholder.svg';
+            this.style.objectFit = 'contain';
+            this.style.padding = '1rem';
+        };
+        if (img.complete && (img.naturalWidth === 0 || img.naturalHeight === 0)) {
+            img.src = '/img/placeholder.svg';
+            img.style.objectFit = 'contain';
+            img.style.padding = '1rem';
+        }
+    });
+});
+</script>
