@@ -1,0 +1,10 @@
+google-cloud-aiplatform
+pymongo
+dynatrace-opentelemetry-core
+opentelemetry-api
+opentelemetry-sdk
+python-dotenv
+requests
+praw
+feedparser
+beautifulsoup4
